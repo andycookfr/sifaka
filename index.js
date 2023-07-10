@@ -34,6 +34,12 @@ function Sifaka(backend, options) {
         this.debug("", "---- Initialising Cache ----")
     }
 
+    // Provide an otel tracer instance and its trace API to enable
+    // tracing in sifaka.
+    // https://open-telemetry.github.io/opentelemetry-js/interfaces/_opentelemetry_api.Tracer.html
+    // https://open-telemetry.github.io/opentelemetry-js/classes/_opentelemetry_api.TraceAPI.html
+    this.tracer = options.tracer || null;
+    this.traceApi = options.traceApi || null;
     this.namespace = options.namespace || null;
     this.pendingCallbacks = {};
     this.pendingTimeouts = {};
@@ -44,6 +50,8 @@ function Sifaka(backend, options) {
 require("util").inherits(Sifaka, EventEmitter);
 
 Sifaka.prototype.debug = function (key, message) {
+    this.traceEvent(message);
+
     if(this.namespace) {
         message = this.namespace + ":" + key + "\t" + message;
     } else {
@@ -77,7 +85,69 @@ Sifaka.prototype.exists = function (key, options, callback) {
     this.backend.exists(key, options, callback);
 };
 
+/**
+ * Instrument a function with otel. This starts a trace span immediately which
+ * ends when the returned callback is invoked.
+ *
+ * If fn is provided, we wrap that function with the span end logic; the provided callback
+ * will be called as normal in the returned function. If no function is provided, the
+ * returned function will simply close the span.
+ *
+ * attrs can be provided to add additional attributes to the resulting span.
+ *
+ * trace support automatic nesting of spans such that is an already-traced function
+ * is provided as fn, the returned function will end a span belonging to that
+ * parent.
+ */
+Sifaka.prototype.trace = function(name, fn, attrs) {
+    if (!this.tracer) {
+        return fn;
+    }
+
+    let options = attrs ? {attributes: attrs} : {};
+
+    var ctx;
+    let parent = (typeof fn === "function") ? fn?.parent : fn;
+    if (this.traceApi && parent) {
+        ctx = this.traceApi.trace.setSpan(
+            this.traceApi.context.active(),
+            parent
+        );
+    }
+
+    const span = this.tracer.startSpan(`sifaka:${name}`, options, ctx)
+
+    let ret = function () {
+        span.end();
+        if (typeof fn === "function") {
+            fn.apply(this, arguments);
+        }
+    }
+    ret.parent = span;
+    return ret;
+}
+
+/**
+ * Registers a single event to the current trace.
+ *
+ * Useful for understanding lock/queue behaviour.
+ */
+Sifaka.prototype.traceEvent = function(name) {
+    if (!this.tracer || !this.traceApi) {
+        return;
+    }
+
+    let span = this.traceApi.trace.getActiveSpan();
+    if (!span) {
+        return;
+    }
+
+    span.addEvent(`sifaka:${name}`)
+}
+
+
 Sifaka.prototype.get = function (key, workFn, options, callback) {
+    callback = this.trace("get()", callback)
     var self = this;
 
     if(arguments.length === 3 && typeof arguments[2] === "function") {
@@ -93,10 +163,12 @@ Sifaka.prototype.get = function (key, workFn, options, callback) {
     if(this._pendingQueueExists(key)) {
         // This node is already waiting for data on this key, add to the queue
         self.debug(key, "CACHE MISS - ADDING TO PENDING");
-        self._addPending(key, callback, options);
+        self._addPending(key, self.trace("queued", callback, {"reason": "node already waiting"}), options);
     } else {
         // Otherwise, hit the backend
         self.backend.get(key, options, function (err, data, state, extra) {
+            callback = self.trace("process-backend-get", callback);
+
             if(err) {
                 if(typeof err === "string") {
                     err = new Error(err);
@@ -115,7 +187,9 @@ Sifaka.prototype.get = function (key, workFn, options, callback) {
                     // undefined (and hopefully not fetching data from the store)
                     callback(err, data, state, extra);
                 } else {
+                    let traceDone = self.trace("deserialize", callback?.parent)
                     self._deserialize(data, extra, function (deserializeErr, deSerializedData, deSerializedExtra) {
+                        traceDone();
                         callback(err || deserializeErr, deSerializedData, state, deSerializedExtra);
                     });
                 }
@@ -124,7 +198,9 @@ Sifaka.prototype.get = function (key, workFn, options, callback) {
                 if(state.stale) {
                     self.stats.stale++;
                     if(!self._hasLocalLock(key)) {
+                        let done = self.trace("stale: acquiring lock", callback?.parent)
                         self.backend.lock(key, null, function (err, acquired) {
+                            done();
                             if(acquired) {
                                 self._setLocalLock(key);
                                 self.debug(key, "GOT LOCK FOR STALE REFRESH");
@@ -145,7 +221,7 @@ Sifaka.prototype.get = function (key, workFn, options, callback) {
                     return callback(err, void 0, state);
                 }
 
-                self._addPending(key, callback, options);
+                self._addPending(key, self.trace("queued", callback, {"reason": "cache miss"}), options);
                 self.debug(key, "CACHE MISS");
 
                 if(err && err.cacheUnavailable === true) { // Failed to get, so lets try to do the work once, locally
@@ -169,7 +245,9 @@ Sifaka.prototype.get = function (key, workFn, options, callback) {
                             return;
                         } else {
                             // We don't know about a remote lock, so we have to try obtain it ourselves.
+                            let done = self.trace("cache miss: acquiring lock", callback?.parent)
                             self.backend.lock(key, null, function (err, acquired) {
+                                done();
                                 if(acquired === true) {
                                     // We got the lock ourselves, so we can do the work
                                     self._setLocalLock(key);
