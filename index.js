@@ -138,7 +138,7 @@ Sifaka.prototype.traceEvent = function(name) {
     }
 
     let span = this.traceApi.trace.getActiveSpan();
-    if (!span || span.ended()) {
+    if (!span || span.ended) {
         return;
     }
 
