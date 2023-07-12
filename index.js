@@ -101,7 +101,7 @@ Sifaka.prototype.exists = function (key, options, callback) {
  */
 Sifaka.prototype.trace = function(name, fn, attrs) {
     if (!this.tracer) {
-        return fn;
+        return typeof fn === "function" ? fn : (() => {});
     }
 
     let options = attrs ? {attributes: attrs} : {};
